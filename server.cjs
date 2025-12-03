@@ -24,20 +24,24 @@ console.log("======================================");
 console.log(" Cardaris Portal API - Configuration");
 console.log("======================================");
 console.log("[ENV] SHOPIFY_STORE_DOMAIN =", SHOPIFY_STORE_DOMAIN);
-console.log("[ENV] SHOPIFY_ACCESS_TOKEN présent ?", SHOPIFY_ACCESS_TOKEN ? "OUI" : "NON");
+console.log(
+  "[ENV] SHOPIFY_ACCESS_TOKEN présent ?",
+  SHOPIFY_ACCESS_TOKEN ? "OUI" : "NON"
+);
 console.log("[ENV] SHOPIFY_TEST_CUSTOMER_ID =", SHOPIFY_TEST_CUSTOMER_ID);
 console.log("======================================");
 
 // Client Axios vers Shopify Admin API
-const shopify = SHOPIFY_STORE_DOMAIN && SHOPIFY_ACCESS_TOKEN
-  ? axios.create({
-      baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-10`,
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-      },
-    })
-  : null;
+const shopify =
+  SHOPIFY_STORE_DOMAIN && SHOPIFY_ACCESS_TOKEN
+    ? axios.create({
+        baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-10`,
+        headers: {
+          "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+          "Content-Type": "application/json",
+        },
+      })
+    : null;
 
 // Récupère l'ID client (priorité à ?customerId dans l'URL)
 function getCustomerIdFromRequest(req) {
@@ -56,6 +60,25 @@ function mapShopifyCustomerToProfile(c) {
     },
     mode: "shopify",
   };
+}
+
+// Helper : transforme le statut Shopify en joli texte FR + variante visuelle
+function mapFulfillmentStatus(fulfillmentStatusRaw) {
+  const status = fulfillmentStatusRaw || "unfulfilled";
+
+  switch (status) {
+    case "fulfilled":
+      return { label: "Expédiée", variant: "success" };
+    case "partial":
+      return { label: "Partiellement expédiée", variant: "warning" };
+    case "restocked":
+      return { label: "Retournée en stock", variant: "default" };
+    case "pending":
+      return { label: "En attente d’expédition", variant: "info" };
+    case "unfulfilled":
+    default:
+      return { label: "En préparation", variant: "info" };
+  }
 }
 
 // ===============================
@@ -123,7 +146,9 @@ app.get("/profile", async (req, res) => {
       err.response?.data || "",
       err.message
     );
-    res.status(500).json({ error: "Erreur serveur /profile", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Erreur serveur /profile", details: err.message });
   }
 });
 
@@ -177,7 +202,10 @@ app.post("/profile/update", async (req, res) => {
     const updatedCustomer = response.data.customer;
     const mappedProfile = mapShopifyCustomerToProfile(updatedCustomer);
 
-    console.log("[/profile/update] Client mis à jour, profil mappé :", mappedProfile);
+    console.log(
+      "[/profile/update] Client mis à jour, profil mappé :",
+      mappedProfile
+    );
 
     res.json({
       ok: true,
@@ -190,12 +218,14 @@ app.post("/profile/update", async (req, res) => {
       err.response?.data || "",
       err.message
     );
-    res.status(500).json({ error: "Erreur update profile", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Erreur update profile", details: err.message });
   }
 });
 
 // ===============================
-// ROUTE COMMANDES
+// ROUTE COMMANDES (liste)
 // ===============================
 app.get("/orders", async (req, res) => {
   try {
@@ -220,20 +250,27 @@ app.get("/orders", async (req, res) => {
       params: {
         status: "any",
         customer_id: customerId,
+        order: "created_at desc",
       },
     });
 
     const orders = response.data.orders || [];
     console.log(`[/orders] ${orders.length} commande(s) trouvée(s).`);
 
-    const data = orders.map((o) => ({
-      id: `#CMD-${o.order_number}`,
-      date: new Date(o.created_at).toLocaleDateString("fr-FR"),
-      totalFormatted: `${o.total_price} €`,
-      description: o.line_items[0]?.title || "Commande Cardaris",
-      status: o.fulfillment_status ? o.fulfillment_status.toUpperCase() : "EN ATTENTE",
-      statusVariant: "info",
-    }));
+    const data = orders.map((o) => {
+      const { label, variant } = mapFulfillmentStatus(o.fulfillment_status);
+
+      return {
+        id: `#CMD-${o.order_number}`,                // ID affiché
+        orderId: o.id,                               // ID Shopify réel
+        date: new Date(o.created_at).toLocaleDateString("fr-FR"),
+        totalFormatted: `${o.total_price} ${o.currency || "EUR"}`,
+        description: o.line_items[0]?.title || "Commande Cardaris",
+        status: label,                               // texte FR
+        statusVariant: variant,                      // couleur badge
+        orderStatusUrl: o.order_status_url || null,  // URL de suivi (ParcelPanel)
+      };
+    });
 
     res.json(data);
   } catch (err) {
@@ -243,7 +280,131 @@ app.get("/orders", async (req, res) => {
       err.response?.data || "",
       err.message
     );
-    res.status(500).json({ error: "Erreur chargement commandes", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Erreur chargement commandes", details: err.message });
+  }
+});
+
+// ===============================
+// ROUTE DÉTAIL COMMANDE
+// ===============================
+app.get("/orders/:orderId", async (req, res) => {
+  try {
+    if (!shopify) {
+      return res.status(500).json({
+        error: "Shopify non configuré (domaine ou token manquant).",
+      });
+    }
+
+    const customerId = getCustomerIdFromRequest(req);
+    if (!customerId) {
+      console.error("[/orders/:orderId] Aucun customerId fourni");
+      return res.status(400).json({
+        error:
+          "Aucun customerId fourni. Utilise ?customerId=ID dans l'URL ou configure SHOPIFY_TEST_CUSTOMER_ID.",
+      });
+    }
+
+    const orderId = req.params.orderId;
+    console.log(
+      "[/orders/:orderId] Chargement détail commande",
+      orderId,
+      "pour client",
+      customerId
+    );
+
+    const response = await shopify.get(`/orders/${orderId}.json`);
+    const o = response.data.order;
+
+    // Sécurité basique : vérifier que la commande appartient bien au client
+    if (o.customer && String(o.customer.id) !== String(customerId)) {
+      console.warn(
+        "[/orders/:orderId] Tentative d'accès à une commande d'un autre client"
+      );
+      return res.status(403).json({
+        error: "Cette commande n'appartient pas à ce client.",
+      });
+    }
+
+    const { label, variant } = mapFulfillmentStatus(o.fulfillment_status);
+
+    const details = {
+      id: `#CMD-${o.order_number}`,
+      orderId: o.id,
+      createdAt: o.created_at,
+      dateFormatted: new Date(o.created_at).toLocaleString("fr-FR"),
+      status: label,
+      statusVariant: variant,
+      financialStatus: o.financial_status || "",
+      currency: o.currency,
+      subtotalPrice: o.subtotal_price,
+      totalPrice: o.total_price,
+      shippingPrice:
+        o.total_shipping_price_set?.shop_money?.amount ?? null,
+      discountCode:
+        (o.discount_codes && o.discount_codes[0]?.code) || null,
+      lineItems: (o.line_items || []).map((li) => ({
+        id: li.id,
+        title: li.title,
+        quantity: li.quantity,
+        sku: li.sku,
+        variantTitle: li.variant_title,
+        price: li.price,
+        total: (Number(li.price || 0) * li.quantity).toFixed(2),
+      })),
+      shippingAddress: o.shipping_address
+        ? {
+            name: `${o.shipping_address.first_name || ""} ${
+              o.shipping_address.last_name || ""
+            }`.trim(),
+            line1: o.shipping_address.address1 || "",
+            line2: o.shipping_address.address2 || "",
+            zip: o.shipping_address.zip || "",
+            city: o.shipping_address.city || "",
+            country:
+              o.shipping_address.country ||
+              o.shipping_address.country_code ||
+              "",
+            phone: o.shipping_address.phone || "",
+          }
+        : null,
+      billingAddress: o.billing_address
+        ? {
+            name: `${o.billing_address.first_name || ""} ${
+              o.billing_address.last_name || ""
+            }`.trim(),
+            line1: o.billing_address.address1 || "",
+            line2: o.billing_address.address2 || "",
+            zip: o.billing_address.zip || "",
+            city: o.billing_address.city || "",
+            country:
+              o.billing_address.country ||
+              o.billing_address.country_code ||
+              "",
+            phone: o.billing_address.phone || "",
+          }
+        : null,
+      shippingLines: (o.shipping_lines || []).map((sl) => ({
+        title: sl.title,
+        price: sl.price,
+        code: sl.code,
+      })),
+      orderStatusUrl: o.order_status_url || null,
+    };
+
+    res.json(details);
+  } catch (err) {
+    console.error(
+      "[/orders/:orderId] error",
+      err.response?.status || "",
+      err.response?.data || "",
+      err.message
+    );
+    res.status(500).json({
+      error: "Erreur chargement détail commande",
+      details: err.message,
+    });
   }
 });
 
@@ -267,9 +428,14 @@ app.get("/addresses", async (req, res) => {
       });
     }
 
-    console.log("[/addresses] Chargement des adresses pour client ID =", customerId);
+    console.log(
+      "[/addresses] Chargement des adresses pour client ID =",
+      customerId
+    );
 
-    const response = await shopify.get(`/customers/${customerId}/addresses.json`);
+    const response = await shopify.get(
+      `/customers/${customerId}/addresses.json`
+    );
     const addresses = response.data.addresses || [];
     console.log(`[/addresses] ${addresses.length} adresse(s) trouvée(s).`);
 
@@ -281,7 +447,9 @@ app.get("/addresses", async (req, res) => {
       err.response?.data || "",
       err.message
     );
-    res.status(500).json({ error: "Erreur chargement adresses", details: err.message });
+    res
+      .status(500)
+      .json({ error: "Erreur chargement adresses", details: err.message });
   }
 });
 
